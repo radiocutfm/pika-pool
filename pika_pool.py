@@ -60,7 +60,6 @@ except ImportError:
     import Queue as queue
 
 import select
-import socket
 import threading
 import time
 
@@ -98,7 +97,7 @@ class Overflow(Error):
 
 class Timeout(Error):
     """
-    Raised when an attempt to `Pool.acquire` a connection has timedout.
+    Raised when an attempt to `Pool.acquire` a connection has timed out.
     """
 
     pass
@@ -120,7 +119,7 @@ class Connection(object):
         pika.exceptions.AMQPConnectionError,
         pika.exceptions.ConnectionClosed,
         pika.exceptions.ChannelClosed,
-        select.error,  # XXX: https://github.com/pika/pika/issues/412
+        pika.exceptions.ChannelWrongStateError,  # XXX: https://github.com/pika/pika/issues/1240
     )
 
     @classmethod
@@ -311,6 +310,35 @@ class QueuedPool(Pool):
         self._avail = self.max_size + self.max_overflow
         super(QueuedPool, self).__init__(create)
 
+    def process_data_events(self):
+        """Calls process_data_events on all connections available in the pool
+
+        Useful for BlockingConnection, you would normally have a Timer thread calling
+        this method every N seconds (with N <= heartbeat_timeout)"""
+
+        connections = []
+        while True:
+            try:
+                fairy = self._queue.get(False)
+            except queue.Empty:
+                break
+            if isinstance(fairy.cxn, pika.BlockingConnection):
+                try:
+                    fairy.cxn.process_data_events()
+                except Connection.connectivity_errors as ex:
+                    if not Connection.is_connection_invalidated(ex):
+                        raise
+                    logger.warning("process_data_events: dropping connection because it's invalid")
+                    continue
+            connections.append(fairy)
+
+        for c in connections:
+            try:
+                self._queue.put_nowait(c)
+            except queue.Full:
+                logger.warning("process_data_events: dropping connection because queue is full")
+                self.close(c)
+
     def acquire(self, timeout=None):
         try:
             fairy = self._queue.get(False)
@@ -357,7 +385,7 @@ class QueuedPool(Pool):
             self._avail -= 1
         try:
             return super(QueuedPool, self)._create()
-        except:
+        except Exception:
             # inc
             with self._avail_lock:
                 self._avail += 1
